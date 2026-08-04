@@ -360,15 +360,30 @@ impl Depacketizer for H264Depacketizer {
                     return Err(PacketError::ErrShortPacket);
                 }
 
-                if self.fua_buffer.is_none() {
+                let b1 = packet[1];
+
+                // A fragment carrying the START bit begins a NEW NAL unit, so
+                // anything still buffered belongs to a sequence whose END
+                // fragment never arrived. Appending to it emits a single NAL
+                // holding two spliced frames: the decoder parses the older
+                // frame's slice header, desyncs partway through, and every
+                // frame predicting from it is corrupt until the next IDR --
+                // silently, since no error is returned and the emitted NAL is
+                // well-formed at the framing level.
+                if b1 & FU_START_BITMASK != 0 {
                     self.fua_buffer = Some(Vec::new());
+                }
+
+                // No START seen means this NAL's head was lost. The remainder
+                // cannot be reconstructed, and buffering it would splice it
+                // onto whatever starts next.
+                if self.fua_buffer.is_none() {
+                    return Ok(());
                 }
 
                 if let Some(fua_buffer) = &mut self.fua_buffer {
                     fua_buffer.extend_from_slice(&packet[FUA_HEADER_SIZE as usize..]);
                 }
-
-                let b1 = packet[1];
                 if b1 & FU_END_BITMASK != 0 {
                     let nalu_ref_idc = b0 & NALU_REF_IDC_BITMASK;
                     let fragmented_nalu_type = b1 & NALU_TYPE_BITMASK;
@@ -922,6 +937,57 @@ mod test {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// A FU-A sequence whose END fragment is lost must not contaminate the
+    /// next NAL unit.
+    ///
+    /// The depacketizer used to append every FU-A payload to `fua_buffer`
+    /// without ever consulting the START bit, and only cleared the buffer when
+    /// an END fragment arrived. Drop one END -- an ordinary event on a lossy
+    /// link -- and the following frame was appended to the previous frame's
+    /// remains, emitting ONE NAL containing both. Nothing reported an error:
+    /// the NAL was well-formed at the framing level, so it was written to
+    /// storage and forwarded to decoders, which parsed the older frame's slice
+    /// header, desynced partway in, and produced macroblock corruption that
+    /// persisted across every predicted frame until the next IDR.
+    #[test]
+    fn test_h264_fua_lost_end_does_not_splice_into_next_nal() -> Result<(), PacketError> {
+        const FU_A: u8 = 28;
+        const NRI: u8 = 0x60;
+        const IDR: u8 = 5;
+
+        fn fragment(start: bool, end: bool, fill: u8) -> Vec<u8> {
+            let mut p = vec![
+                NRI | FU_A,
+                (if start { FU_START_BITMASK } else { 0 }) | (if end { FU_END_BITMASK } else { 0 }) | IDR,
+            ];
+            p.extend_from_slice(&[fill; 100]);
+            p
+        }
+
+        let mut d = H264Depacketizer::default();
+        let mut out = Vec::new();
+        let mut extra = CodecExtra::None;
+
+        // Frame A: START and MIDDLE arrive, its END fragment is lost.
+        d.depacketize(&fragment(true, false, 0xAA), &mut out, &mut extra)?;
+        d.depacketize(&fragment(false, false, 0xAB), &mut out, &mut extra)?;
+        assert!(out.is_empty(), "an incomplete NAL must not be emitted");
+
+        // Frame B arrives complete.
+        d.depacketize(&fragment(true, false, 0xB1), &mut out, &mut extra)?;
+        d.depacketize(&fragment(false, true, 0xB2), &mut out, &mut extra)?;
+
+        // Annex-B start code + reconstructed NAL header + 200 payload bytes.
+        let payload = &out[ANNEXB_NALUSTART_CODE.len() + 1..];
+        assert!(
+            !payload.iter().any(|&b| b == 0xAA || b == 0xAB),
+            "frame B carries bytes from frame A: the two were spliced into one NAL"
+        );
+        assert_eq!(payload.len(), 200, "frame B must be emitted alone");
+
         Ok(())
     }
 }
