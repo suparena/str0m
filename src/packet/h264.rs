@@ -961,7 +961,9 @@ mod test {
         fn fragment(start: bool, end: bool, fill: u8) -> Vec<u8> {
             let mut p = vec![
                 NRI | FU_A,
-                (if start { FU_START_BITMASK } else { 0 }) | (if end { FU_END_BITMASK } else { 0 }) | IDR,
+                (if start { FU_START_BITMASK } else { 0 })
+                    | (if end { FU_END_BITMASK } else { 0 })
+                    | IDR,
             ];
             p.extend_from_slice(&[fill; 100]);
             p
