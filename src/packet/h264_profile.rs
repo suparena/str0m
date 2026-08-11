@@ -69,6 +69,18 @@ impl H264ProfileLevel {
             H264ProfileIdc::X64,
             BitPattern::new(*b"00000000"),
         ),
+        // Constrained High: profile_idc 0x64 with constraint_set4_flag +
+        // constraint_set5_flag (profile-iop 0x0C). Apple's hardware encoder
+        // offers this by default (e.g. profile-level-id 640c1f), and
+        // libWebRTC's table has an entry for it; without one here a 640cXX
+        // fmtp fails to parse a profile at all, so payload matching rejects
+        // the codec regardless of level. See
+        // https://webrtc.googlesource.com/src/+/refs/heads/main/api/video_codecs/h264_profile_level_id.cc
+        (
+            H264Profile::ConstrainedHigh,
+            H264ProfileIdc::X64,
+            BitPattern::new(*b"00001100"),
+        ),
         (
             H264Profile::High10,
             H264ProfileIdc::X6E,
@@ -180,6 +192,7 @@ pub(crate) enum H264Profile {
     Main,
     Extended,
     High,
+    ConstrainedHigh,
     High10,
     High422,
     High444Predictive,
@@ -315,5 +328,34 @@ impl TryFrom<u8> for H264LevelIdc {
             x if (Level5_2 as u8) == x => Ok(Level5_2),
             _ => Err(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// lina-project#285: an iPhone's default hardware-encoder offer
+    /// (profile-level-id 640c1f, Constrained High) failed to parse a
+    /// profile at all, so H.264 payload matching rejected it regardless
+    /// of level and the answer's video section came out empty.
+    #[test]
+    fn constrained_high_parses() {
+        let pl = H264ProfileLevel::try_from(0x640c1f_u32).expect("640c1f must parse");
+        assert_eq!(pl.profile(), H264Profile::ConstrainedHigh);
+        assert_eq!(pl.level(), H264LevelIdc::Level3_1);
+
+        let pl = H264ProfileLevel::try_from(0x640c29_u32).expect("640c29 must parse");
+        assert_eq!(pl.profile(), H264Profile::ConstrainedHigh);
+        assert_eq!(pl.level(), H264LevelIdc::Level4_1);
+    }
+
+    /// The plain High entry (profile-iop 00000000) must be unaffected by
+    /// the Constrained High addition: the two iop patterns are disjoint.
+    #[test]
+    fn high_still_parses_as_high() {
+        let pl = H264ProfileLevel::try_from(0x64001f_u32).expect("64001f must parse");
+        assert_eq!(pl.profile(), H264Profile::High);
+        assert_eq!(pl.level(), H264LevelIdc::Level3_1);
     }
 }
